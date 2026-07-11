@@ -78,11 +78,13 @@ def fetch_words_needing_examples(limit: int, worker_index: int = 1, worker_total
     Phân bổ theo worker_index/worker_total để 10 workers không trùng nhau.
     """
     url = f"{SUPABASE_URL}/rest/v1/zh_dictionary"
-    # KHÔNG dùng 'or' filter — PostgREST không parse được `examples.eq.[]` (lỗi 400).
-    # Thay vào đó: fetch tất cả (kèm field examples) + filter trong Python.
+    # Schema thực tế (từ user):
+    #   id, word, pinyin, pinyin_plain, meaning, hv, level, examples, tags,
+    #   popularity, book_rank, movie_rank, traditional, word_chars, created_at, updated_at
+    # Chọn order by 'id' (PK, luôn tồn tại, ổn định)
     params = {
-        'select': 'id,word,reading,pinyin_no_tones,meaning,hv,level,examples',
-        'order': 'popularity.desc,word.asc',
+        'select': 'id,word,pinyin,pinyin_plain,meaning,hv,level,examples',
+        'order': 'id.asc',
     }
     # Paginate vì Supabase default limit 1000
     all_data = []
@@ -93,7 +95,11 @@ def fetch_words_needing_examples(limit: int, worker_index: int = 1, worker_total
         params['offset'] = offset
         log.info(f"Fetching page offset={offset}...")
         resp = requests.get(url, headers=SUPABASE_HEADERS, params=params, timeout=30)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log.error(f"HTTP {resp.status_code} from Supabase")
+            log.error(f"URL: {resp.url}")
+            log.error(f"Response body: {resp.text[:500]}")
+            resp.raise_for_status()
         page = resp.json()
         if not page:
             break
@@ -189,7 +195,7 @@ def build_user_prompt(batch: list, examples_per_word: int) -> str:
         meaning = r.get('meaning', '')
         if len(meaning) > 80:
             meaning = meaning[:80] + '...'
-        items.append(f"{r['word']}\t{r.get('reading', '')}\t{r.get('hv', '')}\t{meaning}\t{r.get('level', '')}")
+        items.append(f"{r['word']}\t{r.get('pinyin', '')}\t{r.get('hv', '')}\t{meaning}\t{r.get('level', '')}")
     body = '\n'.join(items)
     return f"""Với mỗi dòng dưới đây (tab-separated): từ, pinyin, Hán-Việt, nghĩa, level HSK.
 Hãy viết ĐÚNG {examples_per_word} câu ví dụ cho từng từ.
