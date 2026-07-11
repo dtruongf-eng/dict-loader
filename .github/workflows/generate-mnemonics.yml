@@ -1,18 +1,11 @@
 name: AI Generate Hanzi Mnemonics (10x Parallel)
 
 # Workflow chạy 10 job song song, mỗi job dùng 1 Mistral API key khác nhau.
-# Mỗi job claim 1 chunk chữ từ Supabase (sử dụng PostgreSQL advisory lock để tránh
-# 2 job cùng lấy cùng chữ).
 #
-# Setup Secrets (Settings → Secrets and variables → Actions):
+# Setup Secrets:
 #   - SUPABASE_URL
 #   - SUPABASE_SERVICE_KEY
-#   - MISTRAL_API_KEY_1 .. MISTRAL_API_KEY_10   (10 keys khác nhau)
-#
-# Cách chạy:
-#   1. Vào tab Actions → "AI Generate Hanzi Mnemonics" → Run workflow
-#   2. Nhập tổng số chữ cần process (default: 100, chia 10 = 10 chữ/job)
-#   3. Workflow sẽ chạy 10 job song song, mỗi job xử lý 1/10 số chữ
+#   - MISTRAL_API_KEY_1 .. MISTRAL_API_KEY_10
 
 on:
   workflow_dispatch:
@@ -38,13 +31,9 @@ on:
         default: '5'
         type: string
   schedule:
-    # 3h sáng mỗi ngày (UTC) = 10h sáng giờ VN
     - cron: '0 3 * * *'
 
 jobs:
-  # ============================================================
-  # JOB 0: Tính toán per-job limit và pass cho 10 worker jobs
-  # ============================================================
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -55,7 +44,6 @@ jobs:
       - id: calc
         run: |
           TOTAL="${{ github.event.inputs.total_limit || '100' }}"
-          # Nếu total_limit = 0 (tất cả), mỗi job lấy 0 = không giới hạn
           if [ "$TOTAL" = "0" ]; then
             echo "per_job_limit=0" >> $GITHUB_OUTPUT
           else
@@ -64,20 +52,16 @@ jobs:
           fi
           echo "model=${{ github.event.inputs.model || 'mistral-small-latest' }}" >> $GITHUB_OUTPUT
           echo "batch_size=${{ github.event.inputs.batch_size || '5' }}" >> $GITHUB_OUTPUT
-          echo "Total: $TOTAL, Per job: $(cat $GITHUB_OUTPUT | grep per_job_limit | cut -d= -f2)"
 
-  # ============================================================
-  # 10 WORKER JOBS — chạy song song, mỗi job 1 API key
-  # ============================================================
   generate:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360   # 6 giờ
     strategy:
-      fail-fast: false   # Nếu 1 job fail, 9 job khác vẫn chạy tiếp
+      fail-fast: false
       matrix:
         worker_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -88,11 +72,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install --quiet requests tqdm
+        run: pip install --quiet requests
 
       - name: Select API key for this worker
-        id: key
         env:
           K1: ${{ secrets.MISTRAL_API_KEY_1 }}
           K2: ${{ secrets.MISTRAL_API_KEY_2 }}
@@ -106,7 +88,6 @@ jobs:
           K10: ${{ secrets.MISTRAL_API_KEY_10 }}
         run: |
           IDX=${{ matrix.worker_index }}
-          # Lấy key tương ứng
           case $IDX in
             1)  KEY="$K1" ;;
             2)  KEY="$K2" ;;
@@ -123,10 +104,8 @@ jobs:
             echo "❌ MISTRAL_API_KEY_$IDX chưa được set!"
             exit 1
           fi
-          # Mask key trong log (chỉ hiện 6 ký tự đầu + cuối)
           MASKED="${KEY:0:6}...${KEY: -4}"
           echo "Worker #$IDX using key: $MASKED"
-          # Lưu vào file để step sau đọc (không lộ trong log)
           echo "$KEY" > /tmp/mistral_key.txt
           chmod 600 /tmp/mistral_key.txt
 
@@ -134,13 +113,10 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY_1 }}  # placeholder, sẽ bị override
           WORKER_INDEX: ${{ matrix.worker_index }}
           WORKER_TOTAL: 10
         run: |
-          # Override MISTRAL_API_KEY với key của worker này
           export MISTRAL_API_KEY="$(cat /tmp/mistral_key.txt)"
-          
           python scripts/ai/generate_mnemonics.py \
             --limit "${{ needs.prepare.outputs.per_job_limit }}" \
             --model "${{ needs.prepare.outputs.model }}" \
@@ -155,60 +131,35 @@ jobs:
         with:
           name: mnemonics-log-worker-${{ matrix.worker_index }}-${{ github.run_id }}
           path: |
-            scripts/ai/mnemonics.log
-            scripts/ai/failed_chars.json
+            scripts/ai/mnemonics_worker_${{ matrix.worker_index }}.log
+            scripts/ai/failed_chars_worker_${{ matrix.worker_index }}.json
           retention-days: 7
 
-  # ============================================================
-  # SUMMARY JOB — chạy sau khi 10 worker xong
-  # ============================================================
   summary:
     needs: [prepare, generate]
     runs-on: ubuntu-latest
     if: always()
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: pip install --quiet requests
-
-      - name: Query Supabase for final stats
+      - name: Query Supabase A for final stats
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           python -c "
-          import os, requests, json
-          url = os.environ['SUPABASE_URL'].rstrip('/') + '/rest/v1/rpc/get_mnemonics_stats'
+          import os, requests
           headers = {
               'apikey': os.environ['SUPABASE_SERVICE_KEY'],
               'Authorization': 'Bearer ' + os.environ['SUPABASE_SERVICE_KEY'],
-              'Content-Type': 'application/json',
+              'Prefer': 'count=exact',
           }
-          # Thử gọi RPC; nếu không có thì query trực tiếp
-          try:
-              # Direct count query
-              url2 = os.environ['SUPABASE_URL'].rstrip('/') + '/rest/v1/zh_kanji_builder?select=hanzi'
-              r = requests.get(url2, headers=headers, timeout=15)
-              total = len(r.json()) if r.status_code == 200 else '?'
-              
-              url3 = os.environ['SUPABASE_URL'].rstrip('/') + '/rest/v1/zh_kanji_builder?select=hanzi&or=(mnemonics.is.null,mnemonics.eq.)'
-              r2 = requests.get(url3, headers=headers, timeout=15)
-              missing = len(r2.json()) if r2.status_code == 200 else '?'
-              
-              print(f'')
-              print(f'=== FINAL STATS ===')
-              print(f'Total chars in zh_kanji_builder: {total}')
-              print(f'Chars still missing mnemonics: {missing}')
-              print(f'Chars with mnemonics: {total - missing if isinstance(total, int) and isinstance(missing, int) else \"?\"}')
-              print(f'')
-          except Exception as e:
-              print(f'Could not query stats: {e}')
+          base = os.environ['SUPABASE_URL'].rstrip('/')
+          r1 = requests.get(base + '/rest/v1/zh_kanji_builder?select=hanzi&limit=1', headers=headers, timeout=15)
+          total = r1.headers.get('content-range', '*/?').split('/')[-1] if r1.status_code == 206 else '?'
+          r2 = requests.get(base + '/rest/v1/zh_kanji_builder?select=hanzi&or=(mnemonics.is.null,mnemonics.eq.)&limit=1', headers=headers, timeout=15)
+          missing = r2.headers.get('content-range', '*/?').split('/')[-1] if r2.status_code == 206 else '?'
+          print('')
+          print('=== FINAL STATS (zh_kanji_builder) ===')
+          print(f'Total chars: {total}')
+          print(f'Chars missing mnemonics: {missing}')
+          print('')
           "

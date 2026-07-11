@@ -28,9 +28,9 @@ on:
           - open-mistral-nemo
           - open-mixtral-8x7b
       examples_per_word:
-        description: 'Số ví dụ / từ (default 3)'
+        description: 'Số ví dụ / từ (default 2)'
         required: false
-        default: '3'
+        default: '2'
         type: string
       batch_size:
         description: 'Số từ / API call (default 5)'
@@ -60,14 +60,13 @@ jobs:
             echo "per_job_limit=$PER" >> $GITHUB_OUTPUT
           fi
           echo "model=${{ github.event.inputs.model || 'mistral-small-latest' }}" >> $GITHUB_OUTPUT
-          echo "examples_per_word=${{ github.event.inputs.examples_per_word || '3' }}" >> $GITHUB_OUTPUT
+          echo "examples_per_word=${{ github.event.inputs.examples_per_word || '2' }}" >> $GITHUB_OUTPUT
           echo "batch_size=${{ github.event.inputs.batch_size || '5' }}" >> $GITHUB_OUTPUT
-          echo "Total: $TOTAL, Per job: $(cat $GITHUB_OUTPUT | grep per_job_limit | cut -d= -f2)"
 
   generate:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360   # 6 giờ — đủ cho ~10,000 từ / worker
     strategy:
       fail-fast: false
       matrix:
@@ -84,7 +83,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --quiet requests tqdm
+          pip install --quiet requests
 
       - name: Select API key for this worker
         env:
@@ -163,19 +162,19 @@ jobs:
           headers = {
               'apikey': os.environ['SUPABASE_DICT_SERVICE_KEY'],
               'Authorization': 'Bearer ' + os.environ['SUPABASE_DICT_SERVICE_KEY'],
+              'Prefer': 'count=exact',
           }
           base = os.environ['SUPABASE_DICT_URL'].rstrip('/')
-          # Count total
-          r1 = requests.get(base + '/rest/v1/zh_dictionary?select=word&limit=1',
-                            headers={**headers, 'Prefer': 'count=exact'}, timeout=15)
-          total = r1.headers.get('content-range', '*/?').split('/')[-1] if r1.status_code == 200 else '?'
-          # Count missing examples
-          r2 = requests.get(base + '/rest/v1/zh_dictionary?select=word&or=(examples.is.null,examples.eq.[])',
-                            headers={**headers, 'Prefer': 'count=exact'}, timeout=15)
-          missing = r2.headers.get('content-range', '*/?').split('/')[-1] if r2.status_code == 200 else '?'
+          # Total
+          r1 = requests.get(base + '/rest/v1/zh_dictionary?select=id&limit=1', headers=headers, timeout=15)
+          total = r1.headers.get('content-range', '*/?').split('/')[-1] if r1.status_code == 206 else '?'
+          # Has examples (NOT empty)
+          r2 = requests.get(base + '/rest/v1/zh_dictionary?select=id&examples=neq.%5B%5D&limit=1', headers=headers, timeout=15)
+          has = r2.headers.get('content-range', '*/?').split('/')[-1] if r2.status_code == 206 else '?'
           print('')
           print('=== FINAL STATS (zh_dictionary) ===')
           print(f'Total words: {total}')
-          print(f'Words still missing examples: {missing}')
+          print(f'Words with examples: {has}')
+          print(f'Words still missing examples: {total - has if total != \"?\" and has != \"?\" else \"?\"}')
           print('')
           "
