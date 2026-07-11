@@ -78,11 +78,10 @@ def fetch_words_needing_examples(limit: int, worker_index: int = 1, worker_total
     Phân bổ theo worker_index/worker_total để 10 workers không trùng nhau.
     """
     url = f"{SUPABASE_URL}/rest/v1/zh_dictionary"
-    # Filter: examples IS NULL OR examples = '[]' (empty array)
-    # PostgREST: ?or=(examples.is.null,examples.eq.[])
+    # KHÔNG dùng 'or' filter — PostgREST không parse được `examples.eq.[]` (lỗi 400).
+    # Thay vào đó: fetch tất cả (kèm field examples) + filter trong Python.
     params = {
-        'select': 'id,word,reading,pinyin_no_tones,meaning,hv,level',
-        'or': '(examples.is.null,examples.eq.[])',
+        'select': 'id,word,reading,pinyin_no_tones,meaning,hv,level,examples',
         'order': 'popularity.desc,word.asc',
     }
     # Paginate vì Supabase default limit 1000
@@ -103,21 +102,37 @@ def fetch_words_needing_examples(limit: int, worker_index: int = 1, worker_total
             break
         offset += PAGE_SIZE
     
-    log.info(f"Total words needing examples in DB: {len(all_data)}")
+    log.info(f"Total words in DB: {len(all_data)}")
     
-    # Filter theo worker (hash theo word để phân bổ đều)
+    # Filter trong Python: chỉ giữ words có examples NULL hoặc empty array
+    def is_empty_examples(ex):
+        if ex is None:
+            return True
+        if isinstance(ex, list) and len(ex) == 0:
+            return True
+        if isinstance(ex, str) and ex.strip() in ('', '[]'):
+            return True
+        return False
+    
+    needing = [w for w in all_data if is_empty_examples(w.get('examples'))]
+    log.info(f"Words needing examples: {len(needing)}/{len(all_data)}")
+    
+    # Filter theo worker (hash theo id để phân bổ đều)
     if worker_total > 1:
         def word_hash(w):
-            # Hash theo id (BIGINT) — stable và đều
             return (w.get('id', 0) % worker_total) + 1
-        my_words = [w for w in all_data if word_hash(w) == worker_index]
-        log.info(f"Worker {worker_index}/{worker_total}: claimed {len(my_words)}/{len(all_data)} words")
+        my_words = [w for w in needing if word_hash(w) == worker_index]
+        log.info(f"Worker {worker_index}/{worker_total}: claimed {len(my_words)}/{len(needing)} words")
     else:
-        my_words = all_data
+        my_words = needing
     
     if limit > 0:
         my_words = my_words[:limit]
         log.info(f"Limited to first {limit} words")
+    
+    # Bỏ field examples trước khi trả về (không cần nữa)
+    for w in my_words:
+        w.pop('examples', None)
     
     return my_words
 
