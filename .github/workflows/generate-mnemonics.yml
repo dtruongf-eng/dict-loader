@@ -1,0 +1,214 @@
+name: AI Generate Hanzi Mnemonics (10x Parallel)
+
+# Workflow chạy 10 job song song, mỗi job dùng 1 Mistral API key khác nhau.
+# Mỗi job claim 1 chunk chữ từ Supabase (sử dụng PostgreSQL advisory lock để tránh
+# 2 job cùng lấy cùng chữ).
+#
+# Setup Secrets (Settings → Secrets and variables → Actions):
+#   - SUPABASE_URL
+#   - SUPABASE_SERVICE_KEY
+#   - MISTRAL_API_KEY_1 .. MISTRAL_API_KEY_10   (10 keys khác nhau)
+#
+# Cách chạy:
+#   1. Vào tab Actions → "AI Generate Hanzi Mnemonics" → Run workflow
+#   2. Nhập tổng số chữ cần process (default: 100, chia 10 = 10 chữ/job)
+#   3. Workflow sẽ chạy 10 job song song, mỗi job xử lý 1/10 số chữ
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_limit:
+        description: 'TỔNG số chữ cần process (chia đều cho 10 jobs, 0 = tất cả chữ thiếu)'
+        required: false
+        default: '100'
+        type: string
+      model:
+        description: 'Mistral AI Model'
+        required: false
+        default: 'mistral-small-latest'
+        type: choice
+        options:
+          - mistral-small-latest
+          - mistral-large-latest
+          - open-mistral-nemo
+          - open-mixtral-8x7b
+      batch_size:
+        description: 'Số chữ / API call (default 5)'
+        required: false
+        default: '5'
+        type: string
+  schedule:
+    # 3h sáng mỗi ngày (UTC) = 10h sáng giờ VN
+    - cron: '0 3 * * *'
+
+jobs:
+  # ============================================================
+  # JOB 0: Tính toán per-job limit và pass cho 10 worker jobs
+  # ============================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      per_job_limit: ${{ steps.calc.outputs.per_job_limit }}
+      model: ${{ steps.calc.outputs.model }}
+      batch_size: ${{ steps.calc.outputs.batch_size }}
+    steps:
+      - id: calc
+        run: |
+          TOTAL="${{ github.event.inputs.total_limit || '100' }}"
+          # Nếu total_limit = 0 (tất cả), mỗi job lấy 0 = không giới hạn
+          if [ "$TOTAL" = "0" ]; then
+            echo "per_job_limit=0" >> $GITHUB_OUTPUT
+          else
+            PER=$(( (TOTAL + 9) / 10 ))
+            echo "per_job_limit=$PER" >> $GITHUB_OUTPUT
+          fi
+          echo "model=${{ github.event.inputs.model || 'mistral-small-latest' }}" >> $GITHUB_OUTPUT
+          echo "batch_size=${{ github.event.inputs.batch_size || '5' }}" >> $GITHUB_OUTPUT
+          echo "Total: $TOTAL, Per job: $(cat $GITHUB_OUTPUT | grep per_job_limit | cut -d= -f2)"
+
+  # ============================================================
+  # 10 WORKER JOBS — chạy song song, mỗi job 1 API key
+  # ============================================================
+  generate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false   # Nếu 1 job fail, 9 job khác vẫn chạy tiếp
+      matrix:
+        worker_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet requests tqdm
+
+      - name: Select API key for this worker
+        id: key
+        env:
+          K1: ${{ secrets.MISTRAL_API_KEY_1 }}
+          K2: ${{ secrets.MISTRAL_API_KEY_2 }}
+          K3: ${{ secrets.MISTRAL_API_KEY_3 }}
+          K4: ${{ secrets.MISTRAL_API_KEY_4 }}
+          K5: ${{ secrets.MISTRAL_API_KEY_5 }}
+          K6: ${{ secrets.MISTRAL_API_KEY_6 }}
+          K7: ${{ secrets.MISTRAL_API_KEY_7 }}
+          K8: ${{ secrets.MISTRAL_API_KEY_8 }}
+          K9: ${{ secrets.MISTRAL_API_KEY_9 }}
+          K10: ${{ secrets.MISTRAL_API_KEY_10 }}
+        run: |
+          IDX=${{ matrix.worker_index }}
+          # Lấy key tương ứng
+          case $IDX in
+            1)  KEY="$K1" ;;
+            2)  KEY="$K2" ;;
+            3)  KEY="$K3" ;;
+            4)  KEY="$K4" ;;
+            5)  KEY="$K5" ;;
+            6)  KEY="$K6" ;;
+            7)  KEY="$K7" ;;
+            8)  KEY="$K8" ;;
+            9)  KEY="$K9" ;;
+            10) KEY="$K10" ;;
+          esac
+          if [ -z "$KEY" ]; then
+            echo "❌ MISTRAL_API_KEY_$IDX chưa được set!"
+            exit 1
+          fi
+          # Mask key trong log (chỉ hiện 6 ký tự đầu + cuối)
+          MASKED="${KEY:0:6}...${KEY: -4}"
+          echo "Worker #$IDX using key: $MASKED"
+          # Lưu vào file để step sau đọc (không lộ trong log)
+          echo "$KEY" > /tmp/mistral_key.txt
+          chmod 600 /tmp/mistral_key.txt
+
+      - name: Run AI mnemonics generator (worker ${{ matrix.worker_index }})
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY_1 }}  # placeholder, sẽ bị override
+          WORKER_INDEX: ${{ matrix.worker_index }}
+          WORKER_TOTAL: 10
+        run: |
+          # Override MISTRAL_API_KEY với key của worker này
+          export MISTRAL_API_KEY="$(cat /tmp/mistral_key.txt)"
+          
+          python scripts/ai/generate_mnemonics.py \
+            --limit "${{ needs.prepare.outputs.per_job_limit }}" \
+            --model "${{ needs.prepare.outputs.model }}" \
+            --batch-size "${{ needs.prepare.outputs.batch_size }}" \
+            --delay 2.0 \
+            --worker-index "$WORKER_INDEX" \
+            --worker-total "$WORKER_TOTAL"
+
+      - name: Upload log artifact (worker ${{ matrix.worker_index }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mnemonics-log-worker-${{ matrix.worker_index }}-${{ github.run_id }}
+          path: |
+            scripts/ai/mnemonics.log
+            scripts/ai/failed_chars.json
+          retention-days: 7
+
+  # ============================================================
+  # SUMMARY JOB — chạy sau khi 10 worker xong
+  # ============================================================
+  summary:
+    needs: [prepare, generate]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install --quiet requests
+
+      - name: Query Supabase for final stats
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python -c "
+          import os, requests, json
+          url = os.environ['SUPABASE_URL'].rstrip('/') + '/rest/v1/rpc/get_mnemonics_stats'
+          headers = {
+              'apikey': os.environ['SUPABASE_SERVICE_KEY'],
+              'Authorization': 'Bearer ' + os.environ['SUPABASE_SERVICE_KEY'],
+              'Content-Type': 'application/json',
+          }
+          # Thử gọi RPC; nếu không có thì query trực tiếp
+          try:
+              # Direct count query
+              url2 = os.environ['SUPABASE_URL'].rstrip('/') + '/rest/v1/zh_kanji_builder?select=hanzi'
+              r = requests.get(url2, headers=headers, timeout=15)
+              total = len(r.json()) if r.status_code == 200 else '?'
+              
+              url3 = os.environ['SUPABASE_URL'].rstrip('/') + '/rest/v1/zh_kanji_builder?select=hanzi&or=(mnemonics.is.null,mnemonics.eq.)'
+              r2 = requests.get(url3, headers=headers, timeout=15)
+              missing = len(r2.json()) if r2.status_code == 200 else '?'
+              
+              print(f'')
+              print(f'=== FINAL STATS ===')
+              print(f'Total chars in zh_kanji_builder: {total}')
+              print(f'Chars still missing mnemonics: {missing}')
+              print(f'Chars with mnemonics: {total - missing if isinstance(total, int) and isinstance(missing, int) else \"?\"}')
+              print(f'')
+          except Exception as e:
+              print(f'Could not query stats: {e}')
+          "

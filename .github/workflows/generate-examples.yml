@@ -1,0 +1,181 @@
+name: AI Generate Dictionary Examples (10x Parallel)
+
+# Workflow chạy 10 worker song song, mỗi worker dùng 1 Mistral API key.
+# Mỗi worker claim 1 chunk từ zh_dictionary (Supabase B) WHERE examples IS NULL OR examples = '[]'
+# và gọi Mistral AI để generate ví dụ tiếng Trung + dịch tiếng Việt.
+#
+# Setup Secrets:
+#   - SUPABASE_DICT_URL          https://cmegqiaxvhgmlvyiaahl.supabase.co
+#   - SUPABASE_DICT_SERVICE_KEY  service_role key của Supabase B
+#   - MISTRAL_API_KEY_1 .. MISTRAL_API_KEY_10
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_limit:
+        description: 'TỔNG số từ cần process (chia đều cho 10 jobs, 0 = tất cả từ thiếu)'
+        required: false
+        default: '100'
+        type: string
+      model:
+        description: 'Mistral AI Model'
+        required: false
+        default: 'mistral-small-latest'
+        type: choice
+        options:
+          - mistral-small-latest
+          - mistral-large-latest
+          - open-mistral-nemo
+          - open-mixtral-8x7b
+      examples_per_word:
+        description: 'Số ví dụ / từ (default 3)'
+        required: false
+        default: '3'
+        type: string
+      batch_size:
+        description: 'Số từ / API call (default 5)'
+        required: false
+        default: '5'
+        type: string
+  schedule:
+    # 4h sáng mỗi ngày (UTC) = 11h trưa giờ VN
+    - cron: '0 4 * * *'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      per_job_limit: ${{ steps.calc.outputs.per_job_limit }}
+      model: ${{ steps.calc.outputs.model }}
+      examples_per_word: ${{ steps.calc.outputs.examples_per_word }}
+      batch_size: ${{ steps.calc.outputs.batch_size }}
+    steps:
+      - id: calc
+        run: |
+          TOTAL="${{ github.event.inputs.total_limit || '100' }}"
+          if [ "$TOTAL" = "0" ]; then
+            echo "per_job_limit=0" >> $GITHUB_OUTPUT
+          else
+            PER=$(( (TOTAL + 9) / 10 ))
+            echo "per_job_limit=$PER" >> $GITHUB_OUTPUT
+          fi
+          echo "model=${{ github.event.inputs.model || 'mistral-small-latest' }}" >> $GITHUB_OUTPUT
+          echo "examples_per_word=${{ github.event.inputs.examples_per_word || '3' }}" >> $GITHUB_OUTPUT
+          echo "batch_size=${{ github.event.inputs.batch_size || '5' }}" >> $GITHUB_OUTPUT
+          echo "Total: $TOTAL, Per job: $(cat $GITHUB_OUTPUT | grep per_job_limit | cut -d= -f2)"
+
+  generate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet requests tqdm
+
+      - name: Select API key for this worker
+        env:
+          K1: ${{ secrets.MISTRAL_API_KEY_1 }}
+          K2: ${{ secrets.MISTRAL_API_KEY_2 }}
+          K3: ${{ secrets.MISTRAL_API_KEY_3 }}
+          K4: ${{ secrets.MISTRAL_API_KEY_4 }}
+          K5: ${{ secrets.MISTRAL_API_KEY_5 }}
+          K6: ${{ secrets.MISTRAL_API_KEY_6 }}
+          K7: ${{ secrets.MISTRAL_API_KEY_7 }}
+          K8: ${{ secrets.MISTRAL_API_KEY_8 }}
+          K9: ${{ secrets.MISTRAL_API_KEY_9 }}
+          K10: ${{ secrets.MISTRAL_API_KEY_10 }}
+        run: |
+          IDX=${{ matrix.worker_index }}
+          case $IDX in
+            1)  KEY="$K1" ;;
+            2)  KEY="$K2" ;;
+            3)  KEY="$K3" ;;
+            4)  KEY="$K4" ;;
+            5)  KEY="$K5" ;;
+            6)  KEY="$K6" ;;
+            7)  KEY="$K7" ;;
+            8)  KEY="$K8" ;;
+            9)  KEY="$K9" ;;
+            10) KEY="$K10" ;;
+          esac
+          if [ -z "$KEY" ]; then
+            echo "❌ MISTRAL_API_KEY_$IDX chưa được set!"
+            exit 1
+          fi
+          MASKED="${KEY:0:6}...${KEY: -4}"
+          echo "Worker #$IDX using key: $MASKED"
+          echo "$KEY" > /tmp/mistral_key.txt
+          chmod 600 /tmp/mistral_key.txt
+
+      - name: Run AI examples generator (worker ${{ matrix.worker_index }})
+        env:
+          SUPABASE_DICT_URL: ${{ secrets.SUPABASE_DICT_URL }}
+          SUPABASE_DICT_SERVICE_KEY: ${{ secrets.SUPABASE_DICT_SERVICE_KEY }}
+          WORKER_INDEX: ${{ matrix.worker_index }}
+          WORKER_TOTAL: 10
+        run: |
+          export MISTRAL_API_KEY="$(cat /tmp/mistral_key.txt)"
+          python scripts/ai/generate_examples.py \
+            --limit "${{ needs.prepare.outputs.per_job_limit }}" \
+            --model "${{ needs.prepare.outputs.model }}" \
+            --examples-per-word "${{ needs.prepare.outputs.examples_per_word }}" \
+            --batch-size "${{ needs.prepare.outputs.batch_size }}" \
+            --delay 2.0 \
+            --worker-index "$WORKER_INDEX" \
+            --worker-total "$WORKER_TOTAL"
+
+      - name: Upload log artifact (worker ${{ matrix.worker_index }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: examples-log-worker-${{ matrix.worker_index }}-${{ github.run_id }}
+          path: |
+            scripts/ai/examples_worker_${{ matrix.worker_index }}.log
+            scripts/ai/failed_words_worker_${{ matrix.worker_index }}.json
+          retention-days: 7
+
+  summary:
+    needs: [prepare, generate]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Query Supabase B for final stats
+        env:
+          SUPABASE_DICT_URL: ${{ secrets.SUPABASE_DICT_URL }}
+          SUPABASE_DICT_SERVICE_KEY: ${{ secrets.SUPABASE_DICT_SERVICE_KEY }}
+        run: |
+          python -c "
+          import os, requests
+          headers = {
+              'apikey': os.environ['SUPABASE_DICT_SERVICE_KEY'],
+              'Authorization': 'Bearer ' + os.environ['SUPABASE_DICT_SERVICE_KEY'],
+          }
+          base = os.environ['SUPABASE_DICT_URL'].rstrip('/')
+          # Count total
+          r1 = requests.get(base + '/rest/v1/zh_dictionary?select=word&limit=1',
+                            headers={**headers, 'Prefer': 'count=exact'}, timeout=15)
+          total = r1.headers.get('content-range', '*/?').split('/')[-1] if r1.status_code == 200 else '?'
+          # Count missing examples
+          r2 = requests.get(base + '/rest/v1/zh_dictionary?select=word&or=(examples.is.null,examples.eq.[])',
+                            headers={**headers, 'Prefer': 'count=exact'}, timeout=15)
+          missing = r2.headers.get('content-range', '*/?').split('/')[-1] if r2.status_code == 200 else '?'
+          print('')
+          print('=== FINAL STATS (zh_dictionary) ===')
+          print(f'Total words: {total}')
+          print(f'Words still missing examples: {missing}')
+          print('')
+          "
